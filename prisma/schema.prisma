@@ -1,0 +1,326 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  CUSTOMER
+  VENDOR
+  DRIVER
+  ADMIN
+  SHELTER
+}
+
+enum ListingStatus {
+  FRESH
+  DISCOUNTED
+  FREE
+  COMPOST
+  SOLD_OUT
+  DELETED
+  AUCTION
+}
+
+enum OrderStatus {
+  PLACED
+  ACCEPTED
+  REJECTED
+  READY
+  PICKED_UP
+  DELIVERED
+  CANCELLED
+  REFUND_REQUESTED
+  REFUNDED
+}
+
+enum DeliveryType {
+  PICKUP
+  DELIVERY
+}
+
+enum Allergen {
+  GLUTEN
+  DAIRY
+  EGGS
+  NUTS
+  PEANUTS
+  SOY
+  FISH
+  SHELLFISH
+  SESAME
+  MUSTARD
+  CELERY
+  SULPHITES
+  LUPIN
+  MOLLUSCS
+}
+
+enum AuctionStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+// ─── Core Tables ──────────────────────────────────────────────────────────────
+
+model User {
+  id                    String    @id @default(uuid())
+  email                 String    @unique
+  password              String
+  role                  Role      @default(CUSTOMER)
+  isActive              Boolean   @default(true)
+  isEmailVerified       Boolean   @default(false)
+  emailVerifyToken      String?
+  emailVerifyExpiry     DateTime?
+  passwordResetToken    String?
+  passwordResetExpiry   DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  vendor        Vendor?
+  driver        Driver?
+  shelter       Shelter?
+  orders        Order[]          @relation("CustomerOrders")
+  refreshTokens RefreshToken[]
+  allergens     CustomerAllergen[]
+  auditLogs     AuditLog[]
+  bids          AuctionBid[]
+
+  @@index([email])
+  @@index([role, isActive])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+}
+
+model Vendor {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  storeName   String
+  description String?
+  address     String
+  latitude    Float
+  longitude   Float
+  phone       String?
+  isApproved  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  listings Listing[]
+  orders   Order[]   @relation("VendorOrders")
+
+  @@index([isApproved])
+  @@index([latitude, longitude])
+}
+
+model Driver {
+  id         String   @id @default(uuid())
+  userId     String   @unique
+  phone      String
+  latitude   Float?
+  longitude  Float?
+  isOnline   Boolean  @default(false)
+  isApproved Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orders Order[] @relation("DriverOrders")
+
+  @@index([isOnline, isApproved])
+}
+
+model Shelter {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  name        String
+  address     String
+  latitude    Float
+  longitude   Float
+  phone       String?
+  isApproved  Boolean  @default(false)
+  capacity    Int      @default(50)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orders Order[] @relation("ShelterOrders")
+
+  @@index([isApproved])
+  @@index([latitude, longitude])
+}
+
+// ─── Listing / Food ───────────────────────────────────────────────────────────
+
+model Listing {
+  id              String        @id @default(uuid())
+  vendorId        String
+  name            String
+  description     String?
+  photoUrl        String?
+  originalPrice   Float
+  currentPrice    Float
+  discountPct     Int           @default(0)
+  quantity        Int
+  expiryAt        DateTime
+  decayStartHours Int           @default(24)
+  minPricePct     Int           @default(20)
+  status          ListingStatus @default(FRESH)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  vendor      Vendor              @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  ingredients ListingIngredient[]
+  orderItems  OrderItem[]
+  auction     Auction?
+
+  @@index([status, expiryAt, quantity])
+  @@index([vendorId])
+}
+
+model Ingredient {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+
+  listings  ListingIngredient[]
+  allergens IngredientAllergen[]
+
+  @@index([name])
+}
+
+model ListingIngredient {
+  listingId    String
+  ingredientId String
+
+  listing    Listing    @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  ingredient Ingredient @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+
+  @@id([listingId, ingredientId])
+}
+
+model IngredientAllergen {
+  ingredientId String
+  allergen     Allergen
+
+  ingredient Ingredient @relation(fields: [ingredientId], references: [id], onDelete: Cascade)
+
+  @@id([ingredientId, allergen])
+  @@index([allergen])
+}
+
+model CustomerAllergen {
+  userId   String
+  allergen Allergen
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, allergen])
+}
+
+// ─── Flash Auction ────────────────────────────────────────────────────────────
+
+model Auction {
+  id          String        @id @default(uuid())
+  listingId   String        @unique
+  startsAt    DateTime
+  endsAt      DateTime
+  winnerId    String?
+  winningBid  Float?
+  status      AuctionStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  listing Listing      @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  bids    AuctionBid[]
+
+  @@index([status, endsAt])
+}
+
+model AuctionBid {
+  id        String   @id @default(uuid())
+  auctionId String
+  userId    String
+  amount    Float
+  createdAt DateTime @default(now())
+
+  auction Auction @relation(fields: [auctionId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@index([auctionId, amount])
+  @@index([userId])
+}
+
+// ─── Orders ───────────────────────────────────────────────────────────────────
+
+model Order {
+  id           String       @id @default(uuid())
+  customerId   String?
+  shelterId    String?
+  vendorId     String
+  driverId     String?
+  status       OrderStatus  @default(PLACED)
+  deliveryType DeliveryType @default(PICKUP)
+  totalPrice   Float
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  customer User?    @relation("CustomerOrders", fields: [customerId], references: [id])
+  shelter  Shelter? @relation("ShelterOrders",  fields: [shelterId],  references: [id])
+  vendor   Vendor   @relation("VendorOrders",   fields: [vendorId],   references: [id])
+  driver   Driver?  @relation("DriverOrders",   fields: [driverId],   references: [id])
+  items    OrderItem[]
+
+  @@index([customerId, status])
+  @@index([shelterId,  status])
+  @@index([vendorId,   status])
+  @@index([driverId,   status])
+}
+
+model OrderItem {
+  id        String @id @default(uuid())
+  orderId   String
+  listingId String
+  quantity  Int
+  unitPrice Float
+
+  order   Order   @relation(fields: [orderId],   references: [id], onDelete: Cascade)
+  listing Listing @relation(fields: [listingId], references: [id])
+
+  @@index([orderId])
+}
+
+// ─── Audit ────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  action    String
+  entity    String
+  entityId  String
+  oldValue  Json?
+  newValue  Json?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([entity, entityId])
+}

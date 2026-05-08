@@ -1,0 +1,728 @@
+openapi: 3.0.3
+info:
+  title: RescueBite API
+  description: |
+    Food waste reduction platform. Restaurants list near-expiry food at a discount.
+    
+    **Key Features:**
+    - Price decay state machine (Fresh → Discounted → Free → Compost)
+    - Flash Auction — last 30 min before expiry, reverse auction (lowest bid wins)
+    - Route Optimization — TSP-lite nearest neighbor algorithm for drivers
+    - Geofencing — auto-complete delivery when driver enters 100m radius
+    - Shelter role — charities receive free/compost food
+  version: 2.0.0
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: Auth
+  - name: Users
+  - name: Listings
+  - name: Orders
+  - name: Vendors
+  - name: Drivers
+  - name: Shelters
+  - name: Auctions
+  - name: Ingredients
+  - name: Admin
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+    AuthResponse:
+      type: object
+      properties:
+        user:
+          type: object
+          properties:
+            id: { type: string }
+            email: { type: string }
+            role: { type: string, enum: [CUSTOMER, VENDOR, DRIVER, ADMIN, SHELTER] }
+        accessToken: { type: string, example: "eyJhbGciOiJIUzI1NiJ9..." }
+        refreshToken: { type: string }
+
+    Listing:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        originalPrice: { type: number, example: 2500 }
+        currentPrice: { type: number, example: 1250 }
+        discountPct: { type: integer, example: 50 }
+        quantity: { type: integer }
+        expiryAt: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [FRESH, DISCOUNTED, FREE, COMPOST, SOLD_OUT, DELETED, AUCTION]
+
+    Order:
+      type: object
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [PLACED, ACCEPTED, REJECTED, READY, PICKED_UP, DELIVERED, CANCELLED, REFUND_REQUESTED, REFUNDED]
+        totalPrice: { type: number }
+        deliveryType: { type: string, enum: [PICKUP, DELIVERY] }
+
+    RouteOptimization:
+      type: object
+      properties:
+        driverStart:
+          type: object
+          properties:
+            latitude: { type: number }
+            longitude: { type: number }
+        totalStops: { type: integer }
+        totalDistanceKm: { type: number }
+        estimatedMinutes: { type: integer }
+        algorithm: { type: string, example: "nearest-neighbor-tsp" }
+        route:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [PICKUP, DELIVERY] }
+              name: { type: string }
+              address: { type: string }
+              latitude: { type: number }
+              longitude: { type: number }
+              distanceFromPrev: { type: number, description: "km from previous stop" }
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, example: customer@example.com }
+                password: { type: string, example: Password1 }
+                role: { type: string, enum: [CUSTOMER, VENDOR, DRIVER, SHELTER], default: CUSTOMER }
+      responses:
+        '201': { description: Registered, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResponse' } } } }
+        '409': { description: Email exists }
+        '422': { description: Validation error }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login and receive JWT tokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, example: customer@example.com }
+                password: { type: string, example: Password1 }
+      responses:
+        '200': { description: Login successful, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResponse' } } } }
+        '401': { description: Invalid credentials }
+        '403': { description: Account suspended }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh access token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200': { description: New tokens }
+        '401': { description: Invalid refresh token }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout — blacklist token in Redis, delete refresh token from DB
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200': { description: Logged out }
+
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Get own profile
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: User profile }
+
+  /users/me/allergens:
+    patch:
+      tags: [Users]
+      summary: Update allergen preferences (life-critical validation)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                allergens:
+                  type: array
+                  items: { type: string, enum: [GLUTEN,DAIRY,EGGS,NUTS,PEANUTS,SOY,FISH,SHELLFISH,SESAME,MUSTARD,CELERY,SULPHITES,LUPIN,MOLLUSCS] }
+                  example: [PEANUTS, GLUTEN]
+      responses:
+        '200': { description: Allergens updated }
+
+  /listings:
+    get:
+      tags: [Listings]
+      summary: Browse active listings with cursor pagination
+      parameters:
+        - { in: query, name: cursor, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, default: 20 } }
+        - { in: query, name: status, schema: { type: string } }
+      responses:
+        '200': { description: Paginated listings }
+    post:
+      tags: [Listings]
+      summary: Create listing (Vendor only)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, originalPrice, quantity, expiryAt]
+              properties:
+                name: { type: string, example: "Fresh Sushi Box" }
+                originalPrice: { type: number, example: 2500 }
+                quantity: { type: integer, example: 5 }
+                expiryAt: { type: string, format: date-time, example: "2026-04-27T18:00:00Z" }
+                decayStartHours: { type: integer, default: 24 }
+                minPricePct: { type: integer, default: 20 }
+                ingredientIds: { type: array, items: { type: string } }
+      responses:
+        '201': { description: Created }
+        '403': { description: Not approved vendor }
+
+  /listings/nearby:
+    get:
+      tags: [Listings]
+      summary: Find listings near location — Haversine formula + allergen filter
+      parameters:
+        - { in: query, name: lat, required: true, schema: { type: number, example: 43.238 } }
+        - { in: query, name: lng, required: true, schema: { type: number, example: 76.945 } }
+        - { in: query, name: radius, schema: { type: number, default: 5, description: "Radius in km" } }
+        - { in: query, name: cursor, schema: { type: string } }
+      responses:
+        '200': { description: Nearby listings sorted by distance }
+
+  /listings/allergen-check:
+    post:
+      tags: [Listings]
+      summary: Parse ingredients for allergens — strict validation, no SQL injection possible
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ingredientIds]
+              properties:
+                ingredientIds: { type: array, items: { type: string }, example: ["uuid1", "uuid2"] }
+      responses:
+        '200':
+          description: Allergen check result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  isSafe: { type: boolean }
+                  conflicts: { type: array, items: { type: string } }
+                  detectedAllergens: { type: array, items: { type: string } }
+        '422': { description: Unknown ingredient IDs }
+
+  /listings/{id}:
+    get:
+      tags: [Listings]
+      summary: Get listing detail
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Listing detail with ingredients, allergens, auction }
+        '404': { description: Not found }
+    patch:
+      tags: [Listings]
+      summary: Update listing (Vendor only)
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Listing' }
+      responses:
+        '200': { description: Updated }
+        '403': { description: Not your listing }
+    delete:
+      tags: [Listings]
+      summary: Soft delete listing
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses:
+        '204': { description: Deleted }
+
+  /auctions:
+    get:
+      tags: [Auctions]
+      summary: List active flash auctions (reverse auction — lowest bid wins)
+      parameters:
+        - { in: query, name: cursor, schema: { type: string } }
+      responses:
+        '200': { description: Active auctions sorted by expiry }
+
+  /auctions/{id}:
+    get:
+      tags: [Auctions]
+      summary: Get auction with all bids
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Auction detail with bids sorted lowest first }
+
+  /auctions/{id}/bid:
+    post:
+      tags: [Auctions]
+      summary: Place a bid — must be LOWER than current price (reverse auction)
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: number, example: 500, description: "Must be lower than current listing price" }
+      responses:
+        '201': { description: Bid placed }
+        '400': { description: Bid too high or auction ended }
+        '403': { description: Customers only }
+
+  /orders:
+    post:
+      tags: [Orders]
+      summary: Place order — Redis reservation + DB transaction (prevents overselling)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      listingId: { type: string }
+                      quantity: { type: integer }
+                deliveryType: { type: string, enum: [PICKUP, DELIVERY], default: PICKUP }
+      responses:
+        '201': { description: Order created }
+        '409': { description: Not enough stock }
+    get:
+      tags: [Orders]
+      summary: Get own orders
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Paginated orders }
+
+  /orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get order details
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Order detail }
+        '403': { description: Not your order }
+
+  /orders/{id}/status:
+    patch:
+      tags: [Orders]
+      summary: Update order status (state machine)
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { type: string, enum: [ACCEPTED, REJECTED, READY, PICKED_UP, DELIVERED, CANCELLED] }
+      responses:
+        '200': { description: Status updated }
+        '400': { description: Invalid transition }
+
+  /orders/{id}/refund:
+    post:
+      tags: [Orders]
+      summary: Request refund (delivered orders only)
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, example: "Food was spoiled" }
+      responses:
+        '200': { description: Refund requested }
+
+  /vendors:
+    post:
+      tags: [Vendors]
+      summary: Create vendor profile
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [storeName, address, latitude, longitude]
+              properties:
+                storeName: { type: string, example: "Sushi Palace" }
+                address: { type: string, example: "Almaty, Dostyk 123" }
+                latitude: { type: number, example: 43.238 }
+                longitude: { type: number, example: 76.945 }
+      responses:
+        '201': { description: Vendor created (pending approval) }
+
+  /vendors/me:
+    get:
+      tags: [Vendors]
+      summary: Get vendor profile
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Vendor profile }
+    patch:
+      tags: [Vendors]
+      summary: Update vendor profile
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Updated }
+
+  /vendors/me/orders:
+    get:
+      tags: [Vendors]
+      summary: Get incoming orders
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Paginated orders }
+
+  /drivers:
+    post:
+      tags: [Drivers]
+      summary: Create driver profile
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { type: string, example: "+7 777 123 4567" }
+      responses:
+        '201': { description: Driver created (pending approval) }
+
+  /drivers/me:
+    get:
+      tags: [Drivers]
+      summary: Get driver profile
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Driver profile }
+
+  /drivers/me/status:
+    patch:
+      tags: [Drivers]
+      summary: Toggle online/offline + update coordinates
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                isOnline: { type: boolean }
+                latitude: { type: number }
+                longitude: { type: number }
+      responses:
+        '200': { description: Status updated }
+
+  /drivers/me/location:
+    patch:
+      tags: [Drivers]
+      summary: "🌍 GEOFENCING — Update location. Auto-completes delivery if within 100m of destination"
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [latitude, longitude]
+              properties:
+                latitude: { type: number, example: 43.238 }
+                longitude: { type: number, example: 76.945 }
+      responses:
+        '200':
+          description: Location updated + geofence check result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  location: { type: object }
+                  geofenceChecked: { type: integer }
+                  autoCompleted: { type: array, items: { type: object } }
+                  message: { type: string }
+
+  /drivers/me/route:
+    get:
+      tags: [Drivers]
+      summary: "🗺️ ROUTE OPTIMIZATION — TSP-lite nearest neighbor algorithm"
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - in: query
+          name: orderIds
+          required: true
+          schema: { type: string }
+          description: "Comma-separated order IDs, e.g. uuid1,uuid2,uuid3"
+          example: "550e8400-e29b-41d4-a716-446655440000,550e8400-e29b-41d4-a716-446655440001"
+      responses:
+        '200':
+          description: Optimized route with stops in order
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RouteOptimization' }
+        '400': { description: No orderIds provided or location not set }
+
+  /drivers/me/deliveries:
+    get:
+      tags: [Drivers]
+      summary: Get assigned deliveries
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Paginated deliveries }
+
+  /drivers/me/deliveries/{id}/pickup:
+    patch:
+      tags: [Drivers]
+      summary: Mark order as picked up from vendor
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Status → PICKED_UP }
+
+  /drivers/me/deliveries/{id}/deliver:
+    patch:
+      tags: [Drivers]
+      summary: Mark order as delivered manually
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Status → DELIVERED }
+
+  /shelters:
+    get:
+      tags: [Shelters]
+      summary: List approved shelters (public)
+      responses:
+        '200': { description: Shelter list }
+    post:
+      tags: [Shelters]
+      summary: Create shelter profile
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, address, latitude, longitude]
+              properties:
+                name: { type: string, example: "Almaty Food Bank" }
+                address: { type: string }
+                latitude: { type: number, example: 43.250 }
+                longitude: { type: number, example: 76.920 }
+                capacity: { type: integer, default: 50 }
+      responses:
+        '201': { description: Shelter created (pending approval) }
+
+  /shelters/me:
+    get:
+      tags: [Shelters]
+      summary: Get shelter profile
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Shelter profile }
+    patch:
+      tags: [Shelters]
+      summary: Update shelter profile
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200': { description: Updated }
+
+  /ingredients:
+    get:
+      tags: [Ingredients]
+      summary: List all ingredients
+      parameters:
+        - { in: query, name: search, schema: { type: string } }
+      responses:
+        '200': { description: Ingredients with allergen tags }
+    post:
+      tags: [Ingredients]
+      summary: Create ingredient (Admin or Vendor)
+      security: [{ BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, example: "Salmon" }
+                allergens: { type: array, items: { type: string }, example: [FISH] }
+      responses:
+        '201': { description: Created }
+
+  /admin/vendors/pending:
+    get:
+      tags: [Admin]
+      summary: List pending vendors
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Pending vendors } }
+
+  /admin/vendors/{id}/approve:
+    patch:
+      tags: [Admin]
+      summary: Approve vendor
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses: { '200': { description: Approved } }
+
+  /admin/drivers/pending:
+    get:
+      tags: [Admin]
+      summary: List pending drivers
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Pending drivers } }
+
+  /admin/drivers/{id}/approve:
+    patch:
+      tags: [Admin]
+      summary: Approve driver
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses: { '200': { description: Approved } }
+
+  /admin/shelters/pending:
+    get:
+      tags: [Admin]
+      summary: List pending shelters
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Pending shelters } }
+
+  /admin/shelters/{id}/approve:
+    patch:
+      tags: [Admin]
+      summary: Approve shelter
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      responses: { '200': { description: Approved } }
+
+  /admin/users/{id}/suspend:
+    patch:
+      tags: [Admin]
+      summary: Suspend user
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses: { '200': { description: Suspended } }
+
+  /admin/analytics:
+    get:
+      tags: [Admin]
+      summary: Platform analytics
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Analytics data } }
+
+  /admin/refunds/pending:
+    get:
+      tags: [Admin]
+      summary: List pending refunds
+      security: [{ BearerAuth: [] }]
+      responses: { '200': { description: Refund requests } }
+
+  /admin/refunds/{id}/resolve:
+    patch:
+      tags: [Admin]
+      summary: Resolve refund
+      security: [{ BearerAuth: [] }]
+      parameters: [{ in: path, name: id, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                resolution: { type: string, enum: [REFUNDED, REJECTED] }
+      responses: { '200': { description: Resolved } }
