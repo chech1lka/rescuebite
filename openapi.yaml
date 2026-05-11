@@ -122,6 +122,57 @@ paths:
         '409': { description: Email exists }
         '422': { description: Validation error }
 
+  /auth/verify-email:
+    get:
+      tags: [Auth]
+      summary: Verify email address via token from email link
+      parameters:
+        - in: query
+          name: token
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Email verified successfully }
+        '400': { description: Invalid or expired token }
+
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Request password reset email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, example: user@example.com }
+      responses:
+        '200': { description: Reset email sent if account exists }
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Reset password using token from email
+      parameters:
+        - in: query
+          name: token
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string, example: NewPassword1 }
+      responses:
+        '200': { description: Password reset successfully }
+        '400': { description: Invalid or expired token }
+
   /auth/login:
     post:
       tags: [Auth]
@@ -726,3 +777,39 @@ paths:
               properties:
                 resolution: { type: string, enum: [REFUNDED, REJECTED] }
       responses: { '200': { description: Resolved } }
+
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: List all users
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: All users with verification status
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    email: { type: string }
+                    role: { type: string }
+                    isActive: { type: boolean }
+                    isEmailVerified: { type: boolean }
+                    createdAt: { type: string }
+
+  /admin/users/{id}:
+    delete:
+      tags: [Admin]
+      summary: Delete user permanently
+      security: [{ BearerAuth: [] }]
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: User deleted }
+        '404': { description: User not found }

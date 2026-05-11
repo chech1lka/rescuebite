@@ -80,3 +80,23 @@ router.patch("/refunds/:id/resolve", validate(z.object({ resolution: z.enum(["RE
 });
 
 module.exports = router;
+
+// List all users (admin)
+router.get("/users", async (req, res, next) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: { id: true, email: true, role: true, isActive: true, isEmailVerified: true, createdAt: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(users);
+  } catch (e) { next(e); }
+});
+
+// Delete user (admin)
+router.delete("/users/:id", async (req, res, next) => {
+  try {
+    await prisma.refreshToken.deleteMany({ where: { userId: req.params.id } });
+    await prisma.user.delete({ where: { id: req.params.id } });
+    res.status(204).send();
+  } catch (e) { next(e); }
+});

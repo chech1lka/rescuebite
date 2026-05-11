@@ -91,6 +91,11 @@ const createOrder = async (userId, userRole, { items, deliveryType, shelterId })
     });
 
     for (const r of reservations) await releaseReservation(r.listingId, r.quantity);
+    // Send order confirmation email
+    try {
+      const buyer = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
+      if (buyer) emailService.sendOrderConfirmation(buyer.email, order).catch((e) => console.error("Order email failed:", e.message));
+    } catch {}
     return order;
   } catch (err) {
     for (const r of reservations) await releaseReservation(r.listingId, r.quantity);
